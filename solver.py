@@ -29,7 +29,7 @@ time_matrix = [
 ]
 
 num_families = len(num_students)
-num_taxis = 10 #placeholder value
+num_taxis = len(addresses) #Sets the maximum number of taxis to the number of stops needed, but this will be optimised
 DEPOT = 0 #airport
 SINK = num_families+1 #optional endpoint for taxi routes, a node that is 0 minutes away from any given node, so that taxis can end their journey after the last dropoff
 
@@ -91,7 +91,7 @@ if solution:
     taxi_number = 1
     for vehicle_id in range(num_taxis):
         index = routing.Start(vehicle_id)
-        plan_output = f"Route for taxi {vehicle_id + 1}:\nAirport ->"
+        plan_output = f"Route for taxi {taxi_number}:\nAirport ->"
         route_students = 0
         while not routing.IsEnd(index):
             node = manager.IndexToNode(index)
@@ -108,5 +108,7 @@ if solution:
         plan_output += "\n"
         plan_output += f"Total students: {route_students}\n"
         print(plan_output)
+
+        taxi_number += 1 #increment taxi number after printing a used taxi
 else:
     print("No solution found!")
