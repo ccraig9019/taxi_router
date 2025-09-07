@@ -1,6 +1,9 @@
 import requests
+from dotenv import load_dotenv
+import os
 
-API_KEY = "AIzaSyC4dBR4oi9TrgKew3ytE2Q8RJKYaMHZmYw"
+load_dotenv()
+API_KEY = os.gentenv("API_KEY")
 
 #Example: Airport to various destinations
 origin = "Edinburgh Airport"
