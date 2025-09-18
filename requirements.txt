@@ -1,0 +1,6 @@
+googlemaps==4.10.0
+ortools==9.14.6206
+pandas==2.3.2
+python-dotenv==1.1.1
+requests==2.32.5
+
