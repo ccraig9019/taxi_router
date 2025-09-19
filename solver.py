@@ -14,59 +14,97 @@ API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     raise RuntimeError("No API_KEY found in environment. Put your key in a .env file as API_KEY=...")
 
-#Read CSV file
+# Read CSV file
 data = pd.read_csv("data.csv")
+
+# Check for missing or invalid values in 'Number of Students'
+if data["Number of Students"].isnull().any():
+    bad_rows = data[data["Number of Students"].isnull()]
+    raise ValueError(
+        f"Missing student counts in these rows:\n{bad_rows[['Address','Number of Students']]}"
+    )
+
+# Convert safely to int
+try:
+    num_students = data["Number of Students"].astype(int).tolist()
+except ValueError as e:
+    raise ValueError(
+        "Error converting 'Number of Students' to integers. "
+        "Check your CSV for non-numeric values."
+    ) from e
+
+# Addresses
 addresses = data["Address"].astype(str).tolist()
-num_students = data["Number of Students"].astype(int).tolist()
 
 #Calling specific addresses as locations and appending "Edinburgh, UK" to avoid mismatching in Google Maps
-locations = ["Edinburgh Airport"] + [addr + ", Edinburgh, UK" for addr in addresses]
+locations = ["Edinburgh Airport, Edinburgh, UK"] + [addr + ", Edinburgh, UK" for addr in addresses]
 
 #Distance matrix builder with caching and batching
 #Cache filename to avoid repeated API calls during development
 CACHE_FILE = "distance_matrix_cache.json"
 
+#global penalty for unreachable arcs (meters). Used for debugging and to avoid missing entries
+INF = 10**9
+
 def load_cached_matrix(cache_file, locations):
+    """Return (matrix, origins, destinations) or None."""
     if not os.path.exists(cache_file):
         return None
     with open(cache_file, "r", encoding="utf-8") as f:
         cache = json.load(f)
     #validate that cached locations match (simple string equality)
     if cache.get("locations") == locations:
-        return cache.get("matrix")
+        return cache.get("matrix"), cache.get("origins"), cache.get("destinations")
     return None
 
-def save_cached_matrix(cache_file, locations, matrix):
+def save_cached_matrix(cache_file, locations, matrix, origins, destinations):
     with open(cache_file, "w", encoding="utf-8") as f:
-        json.dump({"locations": locations, "matrix": matrix}, f)
+        json.dump({
+            "locations": locations,
+            "matrix": matrix,
+            "origins": origins,
+            "destinations": destinations
+        }, f)
 
 def build_distance_matrix(locations, api_key, verbose=True):
     """
     Build a full square distance matrix (meters) for 'locations' using Google Distance Matrix API, batching as required.
-
-    Limits handled:
-        - max 25 origins or 25 destinations per request
-        - max elements per request typically 100 (origins * destinations <= 100)
+    Returns: matrix, resolved_origins, resolved_destinations
     """
     url = "https://maps.googleapis.com/maps/api/distancematrix/json"
     n = len(locations)
-    #initialise with very large numbers (penalty) so infeasible arcs are not chosen
-    INF = 10**9
+
+    origin_indices = list(range(n))
+    dest_indices = list(range(n))
+
+
+    # initialize matrix with INF
     matrix = [[INF] * n for _ in range(n)]
 
-    #chunk destinations into blocks up to 25 each
-    max_per_dim = 25 #to respect Google API limits - no more than 25 origins or destinations per request
-    dest_chunks = [locations[i:i+max_per_dim] for i in range(0, n, max_per_dim)]
+    # Preallocate lists to hold resolved addresses for each global index
+    all_origin_addresses = [None] * n
+    all_destination_addresses = [None] * n
+
+    # chunking parameters
+    max_per_dim = 25
+    dest_chunks = [dest_indices[i:i+max_per_dim] for i in range(0, n, max_per_dim)]
+
     for d_chunk_idx, dest_chunk in enumerate(dest_chunks):
         dest_chunk_size = len(dest_chunk)
-        dest_str = "|".join(dest_chunk)
-        #compute how many origins we can put per request such that origins * dest_chunk_size <= 100 and <= 25
-        max_orig_per_req = min(max_per_dim, max(1, 100 // dest_chunk_size)) #to respect Google API limits - no more than 100 total elements (so origins x destinations)
-        #now chunk origins accordingly
-        origin_chunks = [locations[i:i+max_orig_per_req] for i in range(0, n, max_orig_per_req)]
+        dest_chunk_addrs = [locations[j] for j in dest_chunk]
+        dest_str = "|".join(dest_chunk_addrs)
+
+
+        # choose number of origins per request so origins * dest_chunk_size <= 100
+        max_orig_per_req = min(max_per_dim, max(1, 100 // dest_chunk_size))
+        origin_chunks = [origin_indices[i:i+max_orig_per_req] for i in range(0, n, max_orig_per_req)]
+
 
         for o_chunk_idx, origin_chunk in enumerate(origin_chunks):
-            orig_str = "|".join(origin_chunk)
+            orig_addrs = [locations[i] for i in origin_chunk]
+            orig_str = "|".join(orig_addrs)
+
+            
             params = {
                 "origins": orig_str,
                 "destinations": dest_str,
@@ -75,48 +113,83 @@ def build_distance_matrix(locations, api_key, verbose=True):
             }
 
             if verbose:
-                orig_start = o_chunk_idx * max_orig_per_req
-                dest_start = d_chunk_idx * dest_chunk_size
+                orig_start = origin_chunk[0]
+                dest_start = dest_chunk[0]
                 print(f"Requesting origins [{orig_start}:{orig_start+len(origin_chunk)}] -> "
                       f"destinations [{dest_start}:{dest_start+dest_chunk_size}] ...", end=" ")
-                
+
             resp = requests.get(url, params=params)
             if resp.status_code != 200:
                 raise RuntimeError(f"HTTP error from Distance Matrix API: {resp.status_code} {resp.text}")
-            data = resp.json()
-            if data.get("status") != "OK":
-                raise RuntimeError(f"Distance Matrix API returned status={data.get('status')}; message={data.get('error_message')}")
-            
-            rows = data.get("rows", [])
-            #fill matrix for this chunk
+            resp_json = resp.json()
+            if resp_json.get("status") != "OK":
+                raise RuntimeError(f"Distance Matrix API returned status={resp_json.get('status')}; message={resp_json.get('error_message')}")
+
+            # Record resolved addresses into their global positions
+            resp_origins = resp_json.get("origin_addresses", [])
+            resp_dests = resp_json.get("destination_addresses", [])
+            for i_local, addr in enumerate(resp_origins):
+                global_i = origin_chunks[o_chunk_idx][i_local]
+                all_origin_addresses[global_i] = addr
+            for j_local, addr in enumerate(resp_dests):
+                global_j = dest_chunk[j_local]
+                all_destination_addresses[global_j] = addr
+
+
+            # Fill matrix cells for this chunk and log INF insertions
+            rows = resp_json.get("rows", [])
             for i_local, row in enumerate(rows):
                 for j_local, element in enumerate(row.get("elements", [])):
-                    global_i = o_chunk_idx * max_orig_per_req + i_local
-                    global_j = d_chunk_idx * dest_chunk_size + j_local
+                    global_i = origin_chunks[o_chunk_idx][i_local]
+                    global_j = dest_chunk[j_local]
                     if element.get("status") == "OK":
                         matrix[global_i][global_j] = int(element["distance"]["value"])
                     else:
                         matrix[global_i][global_j] = INF
+                        # log a clear, index-aligned warning
+                        print(
+                            f"WARNING: INF inserted for origin[{global_i}] -> destination[{global_j}]: "
+                            f"origin='{locations[global_i]}' dest='{locations[global_j]}' "
+                            f"(API status={element.get('status')})"
+                        )
+
             if verbose:
                 print("done.")
-            #small sleep to be polite (and avoid hitting QPS limits)
             time.sleep(0.1)
-    return matrix
+
+    # If any resolved address is still None, leave it None — we'll print them for debugging later
+    return matrix, all_origin_addresses, all_destination_addresses
 
 #Try loading cached matrix first
-distance_matrix = load_cached_matrix(CACHE_FILE, locations)
-if distance_matrix is None:
+cached = load_cached_matrix(CACHE_FILE, locations)
+if cached is None:
     print("No cached distance matrix found or locations changed. Building new matrix (this may take a moment)...")
-    distance_matrix = build_distance_matrix(locations, API_KEY, verbose=True)
+    distance_matrix, resolved_origins, resolved_destinations = build_distance_matrix(locations, API_KEY, verbose=True)
     #save in cach (matrix is integers; JSON can hold it)
-    save_cached_matrix(CACHE_FILE, locations, distance_matrix)
+    save_cached_matrix(CACHE_FILE, locations, distance_matrix, resolved_origins, resolved_destinations)
 else:
+    distance_matrix, resolved_origins, resolved_destinations = cached
     print("Loaded distance matrix from cache.")
 
 #print small preview for debug
 print("\nSample distance matrix (meters) preview:")
 for row in distance_matrix[:min(6, len(distance_matrix))]:
     print(row[:min(6, len(row))])
+
+#print what Google resolved
+print("\nResolved origins (from API):")
+for i, addr in enumerate(resolved_origins):
+    print(f"{i}: {addr}")
+
+print("\nResolved destinations (from API):")
+for i, addr in enumerate(resolved_destinations):
+    print(f"{i}: {addr}")
+
+#quick validation check: warn if resolved address does not include 'Edinburgh' or 'UK'
+print("\nValidation warnings (if any):")
+for i, addr in enumerate(resolved_destinations):
+    if addr and ("Edinburgh" not in addr and "UK" not in addr):
+        print(f"   >>> Warning: location {i} resolved to '{addr}', which does not contain 'Edinburgh', or 'UK'. Input was: {locations[i]}")
 
 
 #----OR-Tools model setup (using distances in meters as cost)------#
@@ -183,7 +256,7 @@ routing.AddDimensionWithVehicleCapacity(
 search_parameters = pywrapcp.DefaultRoutingSearchParameters()
 search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
 search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-search_parameters.time_limit.FromSeconds(10) #adjust if you want a longer search
+search_parameters.time_limit.FromSeconds(30) #adjust if you want a longer search
 
 #Solve the problem
 solution = routing.SolveWithParameters(search_parameters)
@@ -196,18 +269,33 @@ if solution:
         index = routing.Start(vehicle_id)
         route_students = 0
         route_addresses = []
-        route_distance = 0 #meters
+        route_distance = 0  # meters
+        route_has_INF = False
+
         while not routing.IsEnd(index):
             node = manager.IndexToNode(index)
             next_index = solution.Value(routing.NextVar(index))
             next_node = manager.IndexToNode(next_index)
-            #record family stops (skip depot)
+
             if node != DEPOT:
                 route_addresses.append((locations[node], num_students[node-1]))
                 route_students += num_students[node-1]
-            #add arc distance (including from depot -> first stop and between stops)
-            route_distance += distance_matrix[node][next_node]
+
+            arc_dist = distance_matrix[node][next_node]
+            if arc_dist >= INF:
+                print(f"ERROR: route includes unreachable arc origin[{node}] -> dest[{next_node}]: "
+                      f"'{locations[node]}' -> '{locations[next_node]}' (INF used).")
+                route_has_INF = True
+                # don't add INF numerically to the distance (it will skew totals). mark route invalid instead.
+            else:
+                route_distance += arc_dist
+
             index = next_index
+
+        if route_has_INF:
+            print(f"\nRoute for taxi {taxi_number} contains unreachable leg(s). Check the address resolution above.")
+            # You can choose to continue (print partial route) or skip printing this route:
+            # continue
 
         #Skip printing any empty taxis
         if route_students == 0:
